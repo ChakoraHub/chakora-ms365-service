@@ -3,7 +3,7 @@
 Microsoft 365 to Oracle Employee Sync Service
 
 Architecture:
-    MS 365 Admin → Graph API → ms365_service → Oracle → employee_service → Redis
+    MS 365 Admin → Graph API → ms365_service → Oracle → employee_service
 
 Features:
 - Webhook listener for real-time user creation events
@@ -23,7 +23,6 @@ import hashlib
 import uuid
 import threading
 import oracledb
-import redis
 import httpx
 import io
 import re
@@ -43,7 +42,6 @@ from kafka import KafkaConsumer, KafkaProducer
 from msgraph import GraphServiceClient
 from azure.identity import ClientSecretCredential
 from msgraph.generated.users.users_request_builder import UsersRequestBuilder
-from boto3.dynamodb.conditions import Attr
 
 load_dotenv()
 
@@ -92,7 +90,6 @@ ASSET_SERVICE_URL = os.getenv("ASSET_SERVICE_URL","http://localhost:8090")
 INTERNSHIP_SERVICE_URL = os.getenv("INTERNSHIP_SERVICE_URL","http://localhost:5050")
 EMPLOYEE_SERVICE_URL = os.getenv("EMPLOYEE_SERVICE_URL","http://localhost:8002")
 BLOGGER_SERVICE_URL = os.getenv("BLOGGER_SERVICE_URL","http://localhost:7500")
-REDIS_SERVICE_URL = os.getenv("REDIS_SERVICE_URL","http://localhost:6390")
 BRS_SERVICE_URL = os.getenv("BRS_SERVICE_URL","http://localhost:8020")
 LAMBDA_URL = 'https://lwug4xhfz27whiuu3acjfwsgtm0ttwja.lambda-url.eu-north-1.on.aws/'
 STATIC_CDN = "https://d1pjjckqswt5z7.cloudfront.net"
@@ -137,9 +134,11 @@ MS365_CLIENT_SECRET = settings.MS_CLIENT_SECRET
 # Oracle Configuration
 ORACLE_HOST = os.getenv("ORACLE_HOST", "56.228.73.210")
 ORACLE_PORT = int(os.getenv("ORACLE_PORT", "1521"))
-ORACLE_SERVICE_NAME = os.getenv("ORACLE_SERVICE_NAME", "FREE")
-ORACLE_USER = os.getenv("ORACLE_USER", "system")
-ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD", "Chakorahub123")
+ORACLE_SERVICE_NAME = os.getenv("ORACLE_SERVICE_NAME", "FREEPDB1")
+ORACLE_USER = os.getenv("ORACLE_USER", "SUPPORT")
+ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD", "Welcome123")
+ORACLE_SCHEMA = os.getenv("ORACLE_SCHEMA", "CHAKORA").strip().upper()
+MEETINGS_TABLE = f"{ORACLE_SCHEMA}.NRM_MEETINGS"
 
 # Default Values for New Employees
 DEFAULT_DEPT_ID = "DEPT001"  # HR or General
@@ -473,7 +472,7 @@ def create_employee_in_db(
         
         print(f"✅ Created employee: {employee_name} ({employee_id})")
         
-        # Invalidate employee cache in Redis
+        # Cache invalidation skipped: cache backend is intentionally decoupled.
         invalidate_employee_cache(employee_id)
         
         return {
@@ -491,21 +490,8 @@ def create_employee_in_db(
         raise
 
 def invalidate_employee_cache(employee_id: str = None):
-    try:
-        with httpx.Client(timeout=5) as client:
-            if employee_id:
-                for key in [f"employee:{employee_id}", f"emp_service:profile:{employee_id}", f"user:{employee_id}"]:
-                    client.delete(f"{REDIS_SERVICE_URL}/apicache/delete", params={"cache_key": key})
-
-            # Scan + delete emp_service:* pattern
-            scan_resp = client.get(f"{REDIS_SERVICE_URL}/redis/scan", params={"pattern": "emp_service:*", "db": 5})
-            keys = scan_resp.json().get("keys", [])
-            if keys:
-                client.post(f"{REDIS_SERVICE_URL}/redis/delete", json={"keys": keys, "db": 5})
-
-        print("✅ Invalidated employee cache via redis_service")
-    except Exception as e:
-        print(f"⚠️ Cache invalidation error: {e}")
+    _ = employee_id
+    print("ℹ️ Cache invalidation skipped (backend decoupled)")
 
 # ==========================================
 # MICROSOFT GRAPH FUNCTIONS
@@ -655,18 +641,12 @@ async def sync_all_ms365_users() -> SyncResponse:
 
 @app.get("/")
 def root():
-    redis_status = "disconnected"
-    try:
-        r = httpx.get(f"{REDIS_SERVICE_URL}/health", timeout=2)
-        redis_status = "connected" if r.json().get("success") else "disconnected"
-    except:
-        pass
     return {
         "service": "MS365 Employee Sync Service",
         "version": "1.0.0",
         "status": "running",
         "graph_client": "connected" if graph_client else "disconnected",
-        "redis": redis_status,
+        "cache": "disabled",
     }
 
 @app.get("/health")
@@ -674,15 +654,9 @@ def health():
     health_status = {
         "status": "healthy",
         "graph_api": "connected" if graph_client else "disconnected",
-        "redis": "disconnected",
+        "cache": "disabled",
         "oracle": "unknown"
     }
-    redis_status = "disconnected"
-    try:
-        r = httpx.get(f"{REDIS_SERVICE_URL}/health", timeout=2)
-        redis_status = "connected" if r.json().get("success") else "disconnected"
-    except:
-        pass
     
     # Test Oracle
     try:
@@ -900,7 +874,7 @@ async def get_ms365_users():
 @app.delete("/cache/invalidate")
 def invalidate_cache_endpoint(employee_id: Optional[str] = None):
     """
-    Invalidate employee cache in Redis
+    Invalidate employee cache
     """
     try:
         invalidate_employee_cache(employee_id)
@@ -961,7 +935,7 @@ async def startup_event():
     print("🚀 MS365 Employee Sync Service Starting")
     print("=" * 60)
     print(f"📊 Oracle: {ORACLE_HOST}:{ORACLE_PORT}/{ORACLE_SERVICE_NAME}")
-    print(f"🔴 Redis: {REDIS_SERVICE_URL}")
+    print("🔴 Cache backend: disabled")
     print(f"🔵 MS365 Tenant: {MS365_TENANT_ID}")
     print(f"📡 Webhook URL: {WEBHOOK_URL}")
     print(f"⏰ Poll Interval: {POLL_INTERVAL_MINUTES} minutes")
@@ -1198,12 +1172,29 @@ def _consume_meeting_booked():
             }
             _kafka_publish("teams.link.created", payload)
             if meeting_id:
-                bookings_table.update_item(
-                Key={"bookingId": booking_id},
-                UpdateExpression="SET meeting_id = :m",
-                ExpressionAttributeValues={":m": meeting_id}
-            )
-            print(f"✅ meeting_id saved to DynamoDB | booking_id={booking_id}")
+                conn = None
+                cursor = None
+                try:
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        f"""
+                        UPDATE {MEETINGS_TABLE}
+                        SET MEETING_ID = :1,
+                            UPDATED_AT = SYSTIMESTAMP
+                        WHERE BOOKING_ID = :2
+                        """,
+                        (meeting_id, booking_id),
+                    )
+                    conn.commit()
+                    print(f"✅ meeting_id saved to OracleDB | booking_id={booking_id}")
+                except Exception as db_exc:
+                    print(f"❌ meeting_id save failed in OracleDB | booking_id={booking_id} | error={db_exc}")
+                finally:
+                    if cursor:
+                        cursor.close()
+                    if conn:
+                        conn.close()
 
         except Exception as exc:
             print(f"❌ Teams link creation failed | booking_id={booking_id} | error={exc}")
@@ -1216,14 +1207,7 @@ def _consume_meeting_booked():
             })
 
 
-
-# ----------- Latest code 
-
-dynamodb = boto3.resource(
-    "dynamodb",
-    region_name="eu-north-1"
-)
-bookings_table = dynamodb.Table("Bookings")
+# ----------- Latest code
 
 s3_client = boto3.client(
     "s3",
@@ -1327,10 +1311,44 @@ def process_completed_meetings():
     else:
         print("⚠️ MS_ORGANIZER is empty; transcript fetch will be skipped when meeting_id exists")
 
-    response = bookings_table.scan(
-        FilterExpression=Attr("transcript_status").eq("PENDING")
-    )
-    for booking in response.get("Items", []):
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT
+                BOOKING_ID,
+                STUDENT_EMAIL,
+                MEETING_ID,
+                MEETING_LINK,
+                BOOKING_DATE,
+                START_TIME,
+                DURATION_MINUTES,
+                TRANSCRIPT_STATUS
+            FROM {MEETINGS_TABLE}
+            WHERE NVL(TRANSCRIPT_STATUS, 'PENDING') = 'PENDING'
+            """
+        )
+        rows = cursor.fetchall()
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+    for row in rows:
+        booking = {
+            "bookingId": row[0],
+            "student_email": row[1],
+            "meeting_id": row[2],
+            "meeting_link": row[3],
+            "booking_date": row[4].strftime("%Y-%m-%d") if hasattr(row[4], "strftime") else str(row[4]),
+            "start_time": row[5],
+            "duration_minutes": int(row[6] or 0),
+            "transcript_status": row[7] or "PENDING",
+        }
         booking_id = booking.get("bookingId")
         if booking.get("transcript_status") != "PENDING":
             if DEBUG_MEETING_COMPLETED_BOOKING_ID and booking_id == DEBUG_MEETING_COMPLETED_BOOKING_ID:
@@ -1355,11 +1373,26 @@ def process_completed_meetings():
                 resolved_meeting_id = asyncio.run(lookup_meeting_id_by_join_url(booking_user_id, teams_link))
                 if resolved_meeting_id:
                     meeting_id = resolved_meeting_id
-                    bookings_table.update_item(
-                        Key={"bookingId": booking_id},
-                        UpdateExpression="SET meeting_id = :m",
-                        ExpressionAttributeValues={":m": meeting_id},
-                    )
+                    conn = None
+                    cursor = None
+                    try:
+                        conn = get_db_connection()
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            f"""
+                            UPDATE {MEETINGS_TABLE}
+                            SET MEETING_ID = :1,
+                                UPDATED_AT = SYSTIMESTAMP
+                            WHERE BOOKING_ID = :2
+                            """,
+                            (meeting_id, booking_id),
+                        )
+                        conn.commit()
+                    finally:
+                        if cursor:
+                            cursor.close()
+                        if conn:
+                            conn.close()
                     booking["meeting_id"] = meeting_id
                     print(f"✅ meeting_id backfilled from teams_link | booking_id={booking_id} | meeting_id={meeting_id}")
                 else:
@@ -1408,21 +1441,28 @@ def process_completed_meetings():
                 booking
             )
             print(f"🗂️ Transcript stored reference | booking_id={booking_id} | s3_key={s3_key}")
-            bookings_table.update_item(
-                Key={
-                    "bookingId": booking_id
-                },
-                UpdateExpression="""
-                    SET transcript_status=:s,
-                        transcript_s3_key=:k,
-                        meeting_completed_at=:t
-                """,
-                ExpressionAttributeValues={
-                    ":s": "COMPLETED",
-                    ":k": s3_key,
-                    ":t": datetime.utcnow().isoformat()
-                }
-            )
+            conn = None
+            cursor = None
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"""
+                    UPDATE {MEETINGS_TABLE}
+                    SET TRANSCRIPT_STATUS = :1,
+                        TRANSCRIPT_S3_KEY = :2,
+                        MEETING_COMPLETED_AT = SYSTIMESTAMP,
+                        UPDATED_AT = SYSTIMESTAMP
+                    WHERE BOOKING_ID = :3
+                    """,
+                    ("COMPLETED", s3_key, booking_id),
+                )
+                conn.commit()
+            finally:
+                if cursor:
+                    cursor.close()
+                if conn:
+                    conn.close()
             _kafka_publish(
                 "meeting.completed",
                 {
