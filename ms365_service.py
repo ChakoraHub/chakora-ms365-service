@@ -1984,7 +1984,7 @@ def get_attendee_contact_details(emails: List[str]) -> List[Dict[str, Any]]:
         for row in rows:
             username, email, phone, user_id = row[0], row[1], row[2], row[3]
             contacts.append({
-                "student_name": username or "Learner",
+                "student_name": username or "Student",
                 "email": email or "",
                 "phone_number": str(phone or "").strip(),
                 "student_id": str(user_id or "")
@@ -2056,7 +2056,7 @@ async def dispatch_class_update_to_waba(attendee: Dict[str, Any], event_data: Di
 
     payload = {
         "phone_number": phone,
-        "student_name": attendee.get("student_name") or "Learner",
+        "student_name": attendee.get("student_name") or "Student",
         "trainer_name": trainer_name,
         "course_name": subject,
         "session_time": session_time,
@@ -2115,7 +2115,7 @@ async def process_teams_calendar_event_notification(user_principal: str, event_i
         if force_test_phone:
             print(f"🔒 [SAFETY TEST MODE] NRM_USERS lookup skipped. Dispatching ONLY to test number: {force_test_phone}")
             matched_contacts = [{
-                "student_name": "Learner",
+                "student_name": "Student",
                 "email": attendee_emails[0] if attendee_emails else "test@chakorahub.com",
                 "phone_number": force_test_phone,
                 "student_id": "TEST_001"
