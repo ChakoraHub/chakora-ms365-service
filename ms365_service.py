@@ -923,13 +923,51 @@ async def periodic_sync():
 PROCESSED_CALENDAR_EVENT_IDS = set()
 ENABLE_CALENDAR_EVENT_WATCHER = os.getenv("ENABLE_CALENDAR_EVENT_WATCHER", "true").strip().lower() in ("1", "true", "yes", "on")
 _WATCHER_INITIALIZED = False
+_ORGANIZER_CACHE = []
+_LAST_ORGANIZER_FETCH = 0
+
+def get_all_chakorahub_organizers() -> List[str]:
+    """
+    Fetch all active ChakoraHub employee emails from Oracle DB (CHAKORA.EMP_NRM_EMPLOYEES).
+    Caches the list for 10 minutes to avoid repeated database hits.
+    """
+    global _ORGANIZER_CACHE, _LAST_ORGANIZER_FETCH
+    import time
+    now = time.time()
+    if _ORGANIZER_CACHE and (now - _LAST_ORGANIZER_FETCH) < 600:
+        return _ORGANIZER_CACHE
+
+    default_organizers = [
+        os.getenv("MS_ORGANIZER", "support@chakorahub.com"),
+        "prathibha@chakorahub.com",
+        "admin@chakorahub.com"
+    ]
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT LOWER(EMAIL) FROM CHAKORA.EMP_NRM_EMPLOYEES WHERE EMAIL IS NOT NULL")
+        rows = cursor.fetchall()
+        db_emails = [r[0].strip() for r in rows if r[0] and "@chakorahub.com" in r[0]]
+        cursor.close()
+        conn.close()
+        
+        for d in default_organizers:
+            if d and d.lower() not in db_emails:
+                db_emails.append(d.lower())
+                
+        _ORGANIZER_CACHE = db_emails
+        _LAST_ORGANIZER_FETCH = now
+        return _ORGANIZER_CACHE
+    except Exception as e:
+        print(f"⚠️ Could not load employee emails from Oracle: {e}")
+        return default_organizers
 
 @app.on_event("startup")
 @repeat_every(seconds=15)
 async def watch_teams_calendar_events():
     """
-    Auto-Watcher: Checks Microsoft Graph every 15 seconds.
-    Whenever a meeting is created in Teams, triggers the WhatsApp message automatically!
+    Auto-Watcher: Checks Microsoft Graph every 15 seconds across all ChakoraHub employees.
+    Whenever a meeting with keyword 'session' is created, triggers WhatsApp notification automatically!
     """
     global _WATCHER_INITIALIZED
     if not ENABLE_CALENDAR_EVENT_WATCHER:
@@ -937,11 +975,7 @@ async def watch_teams_calendar_events():
 
     try:
         token = await get_graph_access_token()
-        organizers = [
-            os.getenv("MS_ORGANIZER", "support@chakorahub.com"),
-            "prathibha@chakorahub.com",
-            "admin@chakorahub.com"
-        ]
+        organizers = get_all_chakorahub_organizers()
 
         async with httpx.AsyncClient() as client:
             for org in organizers:
@@ -962,24 +996,46 @@ async def watch_teams_calendar_events():
                         if not event_id:
                             continue
 
+                        # Deduplicate across attendees using iCalUId / joinUrl
+                        meeting_uid = ev.get("iCalUId") or (ev.get("onlineMeeting") or {}).get("joinUrl") or event_id
+                        subj = (ev.get("subject") or "").strip()
+                        is_organizer = ev.get("isOrganizer", True)
+
                         # First run on startup: memorize existing meetings so we don't spam old ones
                         if not _WATCHER_INITIALIZED:
                             PROCESSED_CALENDAR_EVENT_IDS.add(event_id)
+                            PROCESSED_CALENDAR_EVENT_IDS.add(meeting_uid)
                             continue
 
-                        # Brand new meeting detected!
-                        if event_id not in PROCESSED_CALENDAR_EVENT_IDS:
+                        # If already processed by ID or meeting UID, skip immediately
+                        if event_id in PROCESSED_CALENDAR_EVENT_IDS or meeting_uid in PROCESSED_CALENDAR_EVENT_IDS:
+                            continue
+
+                        # KEYWORD FILTER: Only process meetings with keyword 'session' (case-insensitive)
+                        if "session" not in subj.lower():
                             PROCESSED_CALENDAR_EVENT_IDS.add(event_id)
-                            subj = ev.get("subject") or "Teams Meeting"
-                            print(f"\n⚡ [AUTO-WATCHER] Brand New Teams Meeting Detected: '{subj}' (Organized by {org})!")
-                            print(f"🚀 Dispatching WhatsApp notification automatically to 8008370274...")
-                            await process_teams_calendar_event_notification(org, event_id)
+                            PROCESSED_CALENDAR_EVENT_IDS.add(meeting_uid)
+                            continue
+
+                        # Only process from the organizer's calendar to avoid duplicate sends across attendees
+                        if not is_organizer:
+                            PROCESSED_CALENDAR_EVENT_IDS.add(event_id)
+                            PROCESSED_CALENDAR_EVENT_IDS.add(meeting_uid)
+                            continue
+
+                        # Brand new meeting detected! Mark processed immediately
+                        PROCESSED_CALENDAR_EVENT_IDS.add(event_id)
+                        PROCESSED_CALENDAR_EVENT_IDS.add(meeting_uid)
+
+                        print(f"\n⚡ [AUTO-WATCHER] New Session Meeting Detected: '{subj}' (Organized by {org})!")
+                        print(f"🚀 Dispatching WhatsApp notification automatically to registered NRM attendees...")
+                        await process_teams_calendar_event_notification(org, event_id)
                 except Exception:
                     pass
 
         if not _WATCHER_INITIALIZED:
             _WATCHER_INITIALIZED = True
-            print(f"👁️ [AUTO-WATCHER ACTIVE] Monitoring Teams meetings every 15 seconds! (Memorized {len(PROCESSED_CALENDAR_EVENT_IDS)} past meetings)")
+            print(f"👁️ [AUTO-WATCHER ACTIVE] Monitoring Teams meetings across {len(organizers)} ChakoraHub employees every 15s! (Filter: 'session')")
 
     except Exception:
         pass
@@ -1928,7 +1984,7 @@ def get_attendee_contact_details(emails: List[str]) -> List[Dict[str, Any]]:
         for row in rows:
             username, email, phone, user_id = row[0], row[1], row[2], row[3]
             contacts.append({
-                "student_name": username or "Student",
+                "student_name": username or "Learner",
                 "email": email or "",
                 "phone_number": str(phone or "").strip(),
                 "student_id": str(user_id or "")
@@ -2000,7 +2056,7 @@ async def dispatch_class_update_to_waba(attendee: Dict[str, Any], event_data: Di
 
     payload = {
         "phone_number": phone,
-        "student_name": attendee.get("student_name") or "Student",
+        "student_name": attendee.get("student_name") or "Learner",
         "trainer_name": trainer_name,
         "course_name": subject,
         "session_time": session_time,
@@ -2030,15 +2086,21 @@ async def process_teams_calendar_event_notification(user_principal: str, event_i
     """
     Background Task: Processes Teams calendar event trigger:
     1. Fetches event details from Microsoft Graph
-    2. Collects attendee emails
-    3. Matches attendee emails in NRM_USERS database
-    4. Forwards WhatsApp notification payload to WABA service
+    2. Verifies keyword 'session' in meeting subject
+    3. Collects attendee emails
+    4. Matches attendee emails in NRM_USERS database
+    5. Forwards WhatsApp notification payload to WABA service
     """
     try:
         print(f"🚀 Processing Teams calendar event webhook | user={user_principal} | event_id={event_id}")
         event = await get_graph_event_details(user_principal, event_id)
         if not event:
             print(f"⚠️ Could not retrieve event {event_id} from Microsoft Graph")
+            return
+            
+        subject = (event.get("subject") or "").strip()
+        if "session" not in subject.lower():
+            print(f"⏭️ Skipping event '{subject}' | event_id={event_id} | reason=Title does not contain keyword 'session'")
             return
             
         attendees = event.get("attendees", [])
@@ -2053,7 +2115,7 @@ async def process_teams_calendar_event_notification(user_principal: str, event_i
         if force_test_phone:
             print(f"🔒 [SAFETY TEST MODE] NRM_USERS lookup skipped. Dispatching ONLY to test number: {force_test_phone}")
             matched_contacts = [{
-                "student_name": "Test Student",
+                "student_name": "Learner",
                 "email": attendee_emails[0] if attendee_emails else "test@chakorahub.com",
                 "phone_number": force_test_phone,
                 "student_id": "TEST_001"
