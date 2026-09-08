@@ -29,19 +29,26 @@ import re
 import logging
 import boto3
 import asyncio
+import html
 from urllib.parse import urlparse, parse_qs, unquote
 from datetime import datetime, timedelta, timezone
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header, APIRouter, Query
+from fastapi.responses import PlainTextResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, List, Dict, Any
 from apscheduler.schedulers.background import BackgroundScheduler
 from kafka import KafkaConsumer, KafkaProducer
-from msgraph import GraphServiceClient
+try:
+    from msgraph import GraphServiceClient
+    from msgraph.generated.users.users_request_builder import UsersRequestBuilder
+except ImportError:
+    GraphServiceClient = None
+    UsersRequestBuilder = None
+
 from azure.identity import ClientSecretCredential
-from msgraph.generated.users.users_request_builder import UsersRequestBuilder
 
 load_dotenv()
 
@@ -91,6 +98,7 @@ INTERNSHIP_SERVICE_URL = os.getenv("INTERNSHIP_SERVICE_URL","http://localhost:50
 EMPLOYEE_SERVICE_URL = os.getenv("EMPLOYEE_SERVICE_URL","http://localhost:8002")
 BLOGGER_SERVICE_URL = os.getenv("BLOGGER_SERVICE_URL","http://localhost:7500")
 BRS_SERVICE_URL = os.getenv("BRS_SERVICE_URL","http://localhost:8020")
+WABA_SERVICE_URL = os.getenv("WABA_SERVICE_URL", "http://127.0.0.1:2500")
 LAMBDA_URL = 'https://lwug4xhfz27whiuu3acjfwsgtm0ttwja.lambda-url.eu-north-1.on.aws/'
 STATIC_CDN = "https://d1pjjckqswt5z7.cloudfront.net"
 
@@ -176,13 +184,17 @@ app.add_middleware(
 
 # Microsoft Graph Client
 try:
-    credential = ClientSecretCredential(
-        tenant_id=MS365_TENANT_ID,
-        client_id=MS365_CLIENT_ID,
-        client_secret=MS365_CLIENT_SECRET
-    )
-    graph_client = GraphServiceClient(credentials=credential)
-    print("✅ Microsoft Graph client initialized")
+    if GraphServiceClient:
+        credential = ClientSecretCredential(
+            tenant_id=MS365_TENANT_ID,
+            client_id=MS365_CLIENT_ID,
+            client_secret=MS365_CLIENT_SECRET
+        )
+        graph_client = GraphServiceClient(credentials=credential)
+        print("✅ Microsoft Graph client initialized")
+    else:
+        graph_client = None
+        print("ℹ️ Microsoft Graph SDK skipped (HTTP Graph API active)")
 except Exception as e:
     print(f"❌ Graph client initialization failed: {e}")
     graph_client = None
@@ -716,6 +728,7 @@ async def sync_specific_user(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/webhook")
 @app.post("/webhook")
 async def webhook_endpoint(
     request: Request,
@@ -730,9 +743,7 @@ async def webhook_endpoint(
     # Validation request (subscription creation)
     if validationToken:
         print(f"✅ Webhook validation: {validationToken}")
-        return {
-            "validationToken": validationToken
-        }
+        return PlainTextResponse(content=validationToken, status_code=200, media_type="text/plain")
     
     # Notification request
     try:
@@ -907,6 +918,127 @@ async def periodic_sync():
         print(f"✅ Periodic sync complete: {result.employees_synced} new employees")
     except Exception as e:
         print(f"❌ Periodic sync error: {e}")
+
+# ── Real-Time Auto-Watcher for Microsoft Teams Meetings ───────────
+PROCESSED_CALENDAR_EVENT_IDS = set()
+ENABLE_CALENDAR_EVENT_WATCHER = os.getenv("ENABLE_CALENDAR_EVENT_WATCHER", "true").strip().lower() in ("1", "true", "yes", "on")
+_WATCHER_INITIALIZED = False
+_ORGANIZER_CACHE = []
+_LAST_ORGANIZER_FETCH = 0
+
+def get_all_chakorahub_organizers() -> List[str]:
+    """
+    Fetch all active ChakoraHub employee emails from Oracle DB (CHAKORA.EMP_NRM_EMPLOYEES).
+    Caches the list for 10 minutes to avoid repeated database hits.
+    """
+    global _ORGANIZER_CACHE, _LAST_ORGANIZER_FETCH
+    import time
+    now = time.time()
+    if _ORGANIZER_CACHE and (now - _LAST_ORGANIZER_FETCH) < 600:
+        return _ORGANIZER_CACHE
+
+    default_organizers = [
+        os.getenv("MS_ORGANIZER", "support@chakorahub.com"),
+        "prathibha@chakorahub.com",
+        "admin@chakorahub.com"
+    ]
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT LOWER(EMAIL) FROM CHAKORA.EMP_NRM_EMPLOYEES WHERE EMAIL IS NOT NULL")
+        rows = cursor.fetchall()
+        db_emails = [r[0].strip() for r in rows if r[0] and "@chakorahub.com" in r[0]]
+        cursor.close()
+        conn.close()
+        
+        for d in default_organizers:
+            if d and d.lower() not in db_emails:
+                db_emails.append(d.lower())
+                
+        _ORGANIZER_CACHE = db_emails
+        _LAST_ORGANIZER_FETCH = now
+        return _ORGANIZER_CACHE
+    except Exception as e:
+        print(f"⚠️ Could not load employee emails from Oracle: {e}")
+        return default_organizers
+
+@app.on_event("startup")
+@repeat_every(seconds=15)
+async def watch_teams_calendar_events():
+    """
+    Auto-Watcher: Checks Microsoft Graph every 15 seconds across all ChakoraHub employees.
+    Whenever a meeting with keyword 'session' is created, triggers WhatsApp notification automatically!
+    """
+    global _WATCHER_INITIALIZED
+    if not ENABLE_CALENDAR_EVENT_WATCHER:
+        return
+
+    try:
+        token = await get_graph_access_token()
+        organizers = get_all_chakorahub_organizers()
+
+        async with httpx.AsyncClient() as client:
+            for org in organizers:
+                if not org:
+                    continue
+                try:
+                    resp = await client.get(
+                        f"https://graph.microsoft.com/v1.0/users/{org}/events?$top=10&$orderby=createdDateTime desc",
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=10.0
+                    )
+                    if resp.status_code != 200:
+                        continue
+
+                    events = resp.json().get("value", [])
+                    for ev in events:
+                        event_id = ev.get("id")
+                        if not event_id:
+                            continue
+
+                        # Deduplicate across attendees using iCalUId / joinUrl
+                        meeting_uid = ev.get("iCalUId") or (ev.get("onlineMeeting") or {}).get("joinUrl") or event_id
+                        subj = (ev.get("subject") or "").strip()
+                        is_organizer = ev.get("isOrganizer", True)
+
+                        # First run on startup: memorize existing meetings so we don't spam old ones
+                        if not _WATCHER_INITIALIZED:
+                            PROCESSED_CALENDAR_EVENT_IDS.add(event_id)
+                            PROCESSED_CALENDAR_EVENT_IDS.add(meeting_uid)
+                            continue
+
+                        # If already processed by ID or meeting UID, skip immediately
+                        if event_id in PROCESSED_CALENDAR_EVENT_IDS or meeting_uid in PROCESSED_CALENDAR_EVENT_IDS:
+                            continue
+
+                        # KEYWORD FILTER: Only process meetings with keyword 'session' (case-insensitive)
+                        if "session" not in subj.lower():
+                            PROCESSED_CALENDAR_EVENT_IDS.add(event_id)
+                            PROCESSED_CALENDAR_EVENT_IDS.add(meeting_uid)
+                            continue
+
+                        # Only process from the organizer's calendar to avoid duplicate sends across attendees
+                        if not is_organizer:
+                            PROCESSED_CALENDAR_EVENT_IDS.add(event_id)
+                            PROCESSED_CALENDAR_EVENT_IDS.add(meeting_uid)
+                            continue
+
+                        # Brand new meeting detected! Mark processed immediately
+                        PROCESSED_CALENDAR_EVENT_IDS.add(event_id)
+                        PROCESSED_CALENDAR_EVENT_IDS.add(meeting_uid)
+
+                        print(f"\n⚡ [AUTO-WATCHER] New Session Meeting Detected: '{subj}' (Organized by {org})!")
+                        print(f"🚀 Dispatching WhatsApp notification automatically to registered NRM attendees...")
+                        await process_teams_calendar_event_notification(org, event_id)
+                except Exception:
+                    pass
+
+        if not _WATCHER_INITIALIZED:
+            _WATCHER_INITIALIZED = True
+            print(f"👁️ [AUTO-WATCHER ACTIVE] Monitoring Teams meetings across {len(organizers)} ChakoraHub employees every 15s! (Filter: 'session')")
+
+    except Exception:
+        pass
 
 @app.on_event("startup")
 async def startup_transcript_scheduler():
@@ -1779,7 +1911,468 @@ async def get_graph_access_token():
             "access_token"
         ]
 
-# --------- Till here
+# ==============================================================================
+# TEAMS / OUTLOOK CALENDAR EVENT NOTIFICATIONS & WABA WHATSAPP FLOW
+# ==============================================================================
+
+def _clean_html_agenda(raw_text: str) -> str:
+    """Extract and sanitize plain text agenda from meeting body (HTML or plain text)."""
+    if not raw_text:
+        return "No specific agenda provided."
+    text = re.sub(r'<br\s*/?>', '\n', raw_text, flags=re.IGNORECASE)
+    text = re.sub(r'</p>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html.unescape(text)
+    lines = []
+    for line in text.splitlines():
+        l = line.strip()
+        if not l:
+            continue
+        if "Microsoft Teams meeting" in l or "Join on your computer" in l or "Meeting options" in l:
+            break
+        lines.append(l)
+    cleaned = "\n".join(lines[:8])
+    return cleaned if cleaned else "No specific agenda provided."
+
+def _format_event_time_ist(start_iso: str, end_iso: str) -> str:
+    """Convert ISO UTC event timestamps to formatted Indian Standard Time (IST)."""
+    try:
+        clean_start = re.sub(r'\.\d+', '', start_iso or '').replace('Z', '+00:00')
+        clean_end = re.sub(r'\.\d+', '', end_iso or '').replace('Z', '+00:00')
+        
+        if '+' not in clean_start and '-' not in clean_start[-6:]:
+            clean_start += '+00:00'
+        if '+' not in clean_end and '-' not in clean_end[-6:]:
+            clean_end += '+00:00'
+
+        ist_tz = timezone(timedelta(hours=5, minutes=30))
+        dt_start = datetime.fromisoformat(clean_start).astimezone(ist_tz)
+        dt_end = datetime.fromisoformat(clean_end).astimezone(ist_tz)
+
+        start_str = dt_start.strftime("%I:%M %p").lstrip("0")
+        end_str = dt_end.strftime("%I:%M %p").lstrip("0")
+        date_str = dt_start.strftime("%d %b %Y")
+        return f"{start_str} - {end_str} IST, {date_str}"
+    except Exception as e:
+        print(f"⚠️ Timestamp formatting failed ({start_iso} -> {end_iso}): {e}")
+        return f"{start_iso} to {end_iso}"
+
+def get_attendee_contact_details(emails: List[str]) -> List[Dict[str, Any]]:
+    """
+    Query NRM_USERS table in Oracle database by email list to fetch user names and phone numbers.
+    """
+    if not emails:
+        return []
+    
+    contacts = []
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        clean_emails = list({e.strip().lower() for e in emails if e and "@" in e})
+        if not clean_emails:
+            return []
+
+        bind_placeholders = ",".join([f":{i+1}" for i in range(len(clean_emails))])
+        query = f"""
+            SELECT USERNAME, EMAIL, PHONE, ID 
+            FROM CHAKORA.NRM_USERS 
+            WHERE LOWER(EMAIL) IN ({bind_placeholders})
+        """
+        cursor.execute(query, clean_emails)
+        rows = cursor.fetchall()
+        for row in rows:
+            username, email, phone, user_id = row[0], row[1], row[2], row[3]
+            contacts.append({
+                "student_name": username or "Student",
+                "email": email or "",
+                "phone_number": str(phone or "").strip(),
+                "student_id": str(user_id or "")
+            })
+            
+        cursor.close()
+        conn.close()
+        print(f"✅ NRM_USERS lookup: matched {len(contacts)} of {len(clean_emails)} attendees")
+    except Exception as e:
+        print(f"❌ Error looking up attendees in NRM_USERS: {e}")
+        traceback.print_exc()
+        
+    return contacts
+
+async def get_graph_event_details(user_principal: str, event_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch full event metadata from Microsoft Graph:
+    GET /users/{user_principal}/events/{event_id}
+    """
+    try:
+        token = await get_graph_access_token()
+        url = f"https://graph.microsoft.com/v1.0/users/{user_principal}/events/{event_id}"
+        print(f"🔎 Graph event lookup | user={user_principal} | event_id={event_id}")
+        
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                params={
+                    "$select": "id,subject,body,bodyPreview,start,end,organizer,attendees,onlineMeeting,onlineMeetingUrl,webLink,isOnlineMeeting"
+                },
+                timeout=15.0
+            )
+            if resp.status_code != 200:
+                print(f"⚠️ Graph event lookup failed | event_id={event_id} | status={resp.status_code} | body={resp.text}")
+                return None
+            
+            event_data = resp.json()
+            print(f"✅ Graph event lookup success | event_id={event_id} | subject={event_data.get('subject')}")
+            return event_data
+    except Exception as e:
+        print(f"❌ Exception fetching Graph event details: {e}")
+        return None
+
+async def dispatch_class_update_to_waba(attendee: Dict[str, Any], event_data: Dict[str, Any]) -> bool:
+    """
+    Forward attendee and event details to WABA microservice (Port 2500).
+    """
+    phone = attendee.get("phone_number")
+    if not phone:
+        print(f"⚠️ Skipping WABA notification for {attendee.get('email')} (no phone number)")
+        return False
+        
+    subject = event_data.get("subject") or "Upcoming Class Session"
+    organizer = (event_data.get("organizer") or {}).get("emailAddress") or {}
+    trainer_name = organizer.get("name") or organizer.get("address") or "ChakoraHub Trainer"
+    
+    start_time_iso = (event_data.get("start") or {}).get("dateTime", "")
+    end_time_iso = (event_data.get("end") or {}).get("dateTime", "")
+    session_time = _format_event_time_ist(start_time_iso, end_time_iso)
+    
+    agenda = event_data.get("bodyPreview") or ""
+    if not agenda:
+        raw_body = (event_data.get("body") or {}).get("content", "")
+        agenda = _clean_html_agenda(raw_body)
+        
+    online_meeting = event_data.get("onlineMeeting") or {}
+    meeting_link = online_meeting.get("joinUrl") or event_data.get("onlineMeetingUrl") or event_data.get("webLink") or "https://chakorahub.com"
+
+    payload = {
+        "phone_number": phone,
+        "student_name": attendee.get("student_name") or "Student",
+        "trainer_name": trainer_name,
+        "course_name": subject,
+        "session_time": session_time,
+        "agenda": agenda,
+        "meeting_link": meeting_link,
+        "student_id": attendee.get("student_id", "")
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{WABA_SERVICE_URL}/send-class-update",
+                json=payload,
+                timeout=20.0
+            )
+            if resp.status_code in (200, 201):
+                print(f"✅ WhatsApp notification dispatched to {phone} ({attendee.get('student_name')})")
+                return True
+            else:
+                print(f"⚠️ WABA dispatch returned status={resp.status_code}: {resp.text}")
+                return False
+    except Exception as e:
+        print(f"❌ Exception connecting to WABA service at {WABA_SERVICE_URL}: {e}")
+        return False
+
+async def process_teams_calendar_event_notification(user_principal: str, event_id: str):
+    """
+    Background Task: Processes Teams calendar event trigger:
+    1. Fetches event details from Microsoft Graph
+    2. Verifies keyword 'session' in meeting subject
+    3. Collects attendee emails
+    4. Matches attendee emails in NRM_USERS database
+    5. Forwards WhatsApp notification payload to WABA service
+    """
+    try:
+        print(f"🚀 Processing Teams calendar event webhook | user={user_principal} | event_id={event_id}")
+        event = await get_graph_event_details(user_principal, event_id)
+        if not event:
+            print(f"⚠️ Could not retrieve event {event_id} from Microsoft Graph")
+            return
+            
+        subject = (event.get("subject") or "").strip()
+        if "session" not in subject.lower():
+            print(f"⏭️ Skipping event '{subject}' | event_id={event_id} | reason=Title does not contain keyword 'session'")
+            return
+            
+        attendees = event.get("attendees", [])
+        attendee_emails = []
+        for att in attendees:
+            email = (att.get("emailAddress") or {}).get("address", "").strip()
+            if email:
+                attendee_emails.append(email)
+                
+        print(f"👥 Extracted {len(attendee_emails)} attendee email(s): {attendee_emails}")
+        force_test_phone = os.getenv("FORCE_TEST_RECIPIENT_ONLY", "").strip()
+        if force_test_phone:
+            print(f"🔒 [SAFETY TEST MODE] NRM_USERS lookup skipped. Dispatching ONLY to test number: {force_test_phone}")
+            matched_contacts = [{
+                "student_name": "Student",
+                "email": attendee_emails[0] if attendee_emails else "test@chakorahub.com",
+                "phone_number": force_test_phone,
+                "student_id": "TEST_001"
+            }]
+        else:
+            matched_contacts = get_attendee_contact_details(attendee_emails)
+
+        if not matched_contacts:
+            print(f"⚠️ No matching records found in NRM_USERS for: {attendee_emails}")
+            return
+            
+        sent_count = 0
+        for contact in matched_contacts:
+            ok = await dispatch_class_update_to_waba(contact, event)
+            if ok:
+                sent_count += 1
+                
+        print(f"🎉 Teams event processing complete | event_id={event_id} | delivered={sent_count}/{len(matched_contacts)}")
+    except Exception as e:
+        print(f"❌ Error in process_teams_calendar_event_notification: {e}")
+        traceback.print_exc()
+
+# ── Webhook Endpoints for Microsoft Graph Calendar Events ──────────────────────
+
+@app.get("/api/teams/webhook/event-created")
+async def validate_teams_event_webhook(validationToken: Optional[str] = Query(None)):
+    """
+    Microsoft Graph subscription validation handshake (GET).
+    """
+    if validationToken:
+        print(f"✅ Microsoft Graph Webhook validationToken received (GET): {validationToken}")
+        return PlainTextResponse(content=validationToken, status_code=200, media_type="text/plain")
+    return {"status": "active", "endpoint": "/api/teams/webhook/event-created"}
+
+@app.post("/api/teams/webhook/event-created")
+async def handle_teams_event_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    validationToken: Optional[str] = Query(None)
+):
+    """
+    Microsoft Graph subscription webhook endpoint for Teams/Outlook calendar events.
+    Echoes validationToken during setup, and schedules background processing for event notifications.
+    """
+    if validationToken:
+        print(f"✅ Microsoft Graph Webhook validationToken received (POST): {validationToken}")
+        return PlainTextResponse(content=validationToken, status_code=200, media_type="text/plain")
+        
+    try:
+        body = await request.json()
+        print(f"📨 Incoming Teams Webhook notification payload: {json.dumps(body)}")
+        
+        notifications = body.get("value", [])
+        for item in notifications:
+            client_state = item.get("clientState")
+            if WEBHOOK_SECRET and client_state and client_state != WEBHOOK_SECRET:
+                print(f"⚠️ Invalid clientState in webhook notification: {client_state}")
+                continue
+                
+            change_type = item.get("changeType", "").lower()
+            resource = item.get("resource", "")
+            resource_data = item.get("resourceData", {})
+            event_id = resource_data.get("id")
+            
+            user_principal = None
+            if "Users/" in resource or "Users('" in resource:
+                parts = re.split(r"Users[/\(]['\"]?", resource, flags=re.IGNORECASE)
+                if len(parts) > 1:
+                    user_principal = re.split(r"['\"\)/]", parts[1])[0]
+                    
+            if not user_principal:
+                user_principal = os.getenv("MS_ORGANIZER") or settings.MS_CLIENT_ID
+                
+            if not event_id and "/events/" in resource.lower():
+                event_id = resource.split("/events/")[1].split("/")[0].strip(")'\"")
+                
+            print(f"📅 Calendar event notification: changeType={change_type} | user={user_principal} | event_id={event_id}")
+            
+            if event_id:
+                background_tasks.add_task(
+                    process_teams_calendar_event_notification,
+                    user_principal,
+                    event_id
+                )
+
+        return Response(status_code=202)
+    except Exception as e:
+        print(f"❌ Error handling Teams calendar webhook: {e}")
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+# ── Helper Management Endpoints for Graph Subscriptions ───────────────────────
+
+@app.post("/api/teams/subscriptions/create")
+async def create_teams_event_subscription(
+    user_principal: Optional[str] = Query(None, description="Organizer email or user ID")
+):
+    """
+    Register a Microsoft Graph change notification subscription for calendar events.
+    """
+    target_user = user_principal or os.getenv("MS_ORGANIZER")
+    if not target_user:
+        raise HTTPException(status_code=400, detail="user_principal or MS_ORGANIZER is required")
+        
+    try:
+        token = await get_graph_access_token()
+        webhook_target_url = f"{WEBHOOK_URL.rstrip('/')}/api/teams/webhook/event-created"
+        expiration = (datetime.now(timezone.utc) + timedelta(days=2, hours=20)).isoformat().replace("+00:00", "Z")
+        
+        subscription_payload = {
+            "changeType": "created,updated",
+            "notificationUrl": webhook_target_url,
+            "resource": f"/users/{target_user}/events",
+            "expirationDateTime": expiration,
+            "clientState": WEBHOOK_SECRET
+        }
+        
+        print(f"📡 Creating Graph subscription for {target_user} -> {webhook_target_url}")
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://graph.microsoft.com/v1.0/subscriptions",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                },
+                json=subscription_payload,
+                timeout=20.0
+            )
+            
+            if resp.status_code not in (200, 201):
+                print(f"❌ Graph subscription creation failed: status={resp.status_code} | body={resp.text}")
+                return {
+                    "success": False,
+                    "status_code": resp.status_code,
+                    "response": resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text
+                }
+                
+            data = resp.json()
+            print(f"✅ Graph subscription created successfully: ID={data.get('id')}")
+            return {
+                "success": True,
+                "subscription": data
+            }
+    except Exception as e:
+        print(f"❌ Error creating graph subscription: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/teams/subscriptions")
+async def list_teams_event_subscriptions():
+    """
+    List all active Microsoft Graph subscriptions.
+    """
+    try:
+        token = await get_graph_access_token()
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://graph.microsoft.com/v1.0/subscriptions",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/teams/subscriptions/{subscription_id}")
+async def delete_teams_event_subscription(subscription_id: str):
+    """
+    Delete an active Microsoft Graph subscription.
+    """
+    try:
+        token = await get_graph_access_token()
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(
+                f"https://graph.microsoft.com/v1.0/subscriptions/{subscription_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0
+            )
+            if resp.status_code not in (200, 204):
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return {"success": True, "message": f"Subscription {subscription_id} deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/teams/test-event-notification")
+async def test_teams_event_notification(
+    event_id: str = Query(..., description="Microsoft Graph event ID"),
+    user_principal: Optional[str] = Query(None, description="Organizer email or ID"),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Manually trigger processing of an existing Teams event for end-to-end verification.
+    """
+    target_user = user_principal or os.getenv("MS_ORGANIZER")
+    if not target_user:
+        raise HTTPException(status_code=400, detail="user_principal or MS_ORGANIZER is required")
+        
+    await process_teams_calendar_event_notification(target_user, event_id)
+    return {"success": True, "message": f"Triggered processing for event {event_id} (user={target_user})"}
+
+@app.post("/api/teams/trigger-latest-meeting-notification")
+async def trigger_latest_meeting_notification(
+    user_principal: Optional[str] = Query(None, description="Organizer email or ID")
+):
+    """
+    Fetch the most recently created Teams meeting for the organizer and dispatch WhatsApp notification.
+    """
+    target_user = user_principal or os.getenv("MS_ORGANIZER")
+    if not target_user:
+        raise HTTPException(status_code=400, detail="user_principal or MS_ORGANIZER is required")
+        
+    token = await get_graph_access_token()
+    
+    # If specific user passed, check that user. Otherwise, check active organizers and pick the newest
+    organizer_candidates = [user_principal] if user_principal else [
+        os.getenv("MS_ORGANIZER", "support@chakorahub.com"),
+        "prathibha@chakorahub.com",
+        "admin@chakorahub.com"
+    ]
+    
+    newest_event = None
+    target_user = None
+
+    async with httpx.AsyncClient() as client:
+        for candidate in organizer_candidates:
+            if not candidate:
+                continue
+            try:
+                resp = await client.get(
+                    f"https://graph.microsoft.com/v1.0/users/{candidate}/events?$top=1&$orderby=createdDateTime desc",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10.0
+                )
+                if resp.status_code == 200:
+                    events = resp.json().get("value", [])
+                    if events:
+                        candidate_event = events[0]
+                        cand_created = candidate_event.get("createdDateTime", "")
+                        if not newest_event or cand_created > newest_event.get("createdDateTime", ""):
+                            newest_event = candidate_event
+                            target_user = candidate
+            except Exception:
+                pass
+        
+    if not newest_event:
+        return {"success": False, "message": "No calendar events found across organizers"}
+        
+    event_id = newest_event.get("id")
+    await process_teams_calendar_event_notification(target_user, event_id)
+    return {
+        "success": True,
+        "message": f"Dispatched notification for latest event '{newest_event.get('subject')}' (Organized by {target_user})",
+        "event_subject": newest_event.get("subject"),
+        "organizer": target_user,
+        "event_id": event_id
+    }
 
 @app.on_event("startup")
 async def start_kafka_consumer():
